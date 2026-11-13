@@ -2,14 +2,13 @@ import { Bounds } from '../../container/bounds/Bounds';
 import { getGlobalBounds } from '../../container/bounds/getGlobalBounds';
 import { Container } from '../../container/Container';
 import { TilingSprite } from '../TilingSprite';
+import { getTrimOffset } from '../utils/getTrimOffset';
 import { setUvs } from '../utils/setUvs';
 import '../init';
 import '../../mesh/init';
 import { getTexture, getWebGLRenderer } from '@test-utils';
-import { Point, Rectangle } from '~/maths';
-import { CanvasRenderer, ImageSource, Texture } from '~/rendering';
-
-import type { TextureSource } from '~/rendering';
+import { Matrix, Point, Rectangle } from '~/maths';
+import { CanvasRenderer, ImageSource, Texture, TextureSource } from '~/rendering';
 
 describe('TilingSprite', () =>
 {
@@ -293,6 +292,240 @@ describe('TilingSprite', () =>
             const dot = (ex[0] * ey[0]) + (ex[1] * ey[1]);
 
             expect(dot).toBeCloseTo(0, 5);
+        });
+    });
+
+    describe('cropped (trimmed) texture alignment', () =>
+    {
+        // A texture cropped out of a larger artwork must still tile as if the visible
+        // region were a standalone image: tile (0, 0) is the region's top-left, not
+        // the artwork's. The correction is trim.x/frame.width, trim.y/frame.height,
+        // independent of tile rotation, scale and position.
+
+        // Tile transform matching Pixi's Transform: T * R * S
+        const tileMatrix = (rotation: number, scaleX: number, scaleY: number,
+            positionX: number, positionY: number) =>
+        {
+            const c = Math.cos(rotation);
+            const s = Math.sin(rotation);
+
+            return new Matrix(
+                c * scaleX, s * scaleX, -s * scaleY, c * scaleY,
+                positionX, positionY,
+            );
+        };
+
+        const makeCroppedTexture = (sourceWidth: number, sourceHeight: number,
+            frame: Rectangle, orig: Rectangle, trim?: Rectangle) =>
+        {
+            const texture = new Texture({
+                source: new TextureSource({ width: sourceWidth, height: sourceHeight }),
+                frame,
+            });
+
+            // mirror how a spritesheet records the untrimmed artwork and its crop
+            (texture as any).orig = orig;
+            if (trim) (texture as any).trim = trim;
+            texture.updateUvs();
+
+            return texture;
+        };
+
+        // Recover the UV at a panel-local point by interpolating the quad corners
+        // setUvs writes, exactly as the GPU interpolates vertex uvs.
+        const sampleAt = (uvs: Float32Array, panelWidth: number, panelHeight: number,
+            x: number, y: number) =>
+        {
+            const fx = x / panelWidth;
+            const fy = y / panelHeight;
+            const lerp = (a: number, b: number, t: number) => a + ((b - a) * t);
+            const topX = lerp(uvs[0], uvs[2], fx);
+            const topY = lerp(uvs[1], uvs[3], fx);
+            const bottomX = lerp(uvs[6], uvs[4], fx);
+            const bottomY = lerp(uvs[7], uvs[5], fx);
+
+            return [lerp(topX, bottomX, fy), lerp(topY, bottomY, fy)];
+        };
+
+        type SampleCase = [number, number, number, number];
+
+        const sample = (texture: Texture, panelWidth: number, panelHeight: number,
+            rotation: number, scaleX: number, scaleY: number,
+            positionX: number, positionY: number, cases: SampleCase[]) =>
+        {
+            const sprite = {
+                texture,
+                width: panelWidth,
+                height: panelHeight,
+                anchor: { x: 0, y: 0 },
+                applyAnchorToTexture: false,
+                _tileTransform: { matrix: tileMatrix(rotation, scaleX, scaleY, positionX, positionY) },
+            } as unknown as TilingSprite;
+
+            const uvs = new Float32Array(8);
+
+            uvs.set([0, 0, 1, 0, 1, 1, 0, 1]);
+            setUvs(sprite, uvs);
+
+            return cases.map(([x, y]) => sampleAt(uvs, panelWidth, panelHeight, x, y));
+        };
+
+        const panelWidth = 128;
+        const panelHeight = 64;
+        const frame = new Rectangle(8, 4, 48, 24);
+        const trim = new Rectangle(8, 4, 48, 24);
+        const orig = new Rectangle(0, 0, 64, 32);
+
+        it('re-anchors the pattern on the visible region with an identity tile transform', () =>
+        {
+            const texture = makeCroppedTexture(64, 32, frame, orig, trim);
+            const cases: SampleCase[] = [
+                [0, 0, -0.1667, -0.1667],
+                [8, 4, 0.0, 0.0],
+                [64, 32, 1.1667, 1.1667],
+                [128, 0, 2.5, -0.1667],
+                [20, 50, 0.25, 1.9167],
+            ];
+
+            const samples = sample(texture, panelWidth, panelHeight, 0, 1, 1, 0, 0, cases);
+
+            cases.forEach(([, , expectedU, expectedV], i) =>
+            {
+                expect(samples[i][0]).toBeCloseTo(expectedU, 3);
+                expect(samples[i][1]).toBeCloseTo(expectedV, 3);
+            });
+        });
+
+        it('keeps the same phase correction under rotation', () =>
+        {
+            const texture = makeCroppedTexture(64, 32, frame, orig, trim);
+            const cases: SampleCase[] = [
+                [8, 4, 0.0193, -0.1890],
+                [64, 32, 1.3214, -0.3453],
+                [128, 0, 2.1427, -2.8333],
+            ];
+
+            const samples = sample(texture, panelWidth, panelHeight, Math.PI / 6, 1, 1, 0, 0, cases);
+
+            cases.forEach(([, , expectedU, expectedV], i) =>
+            {
+                expect(samples[i][0]).toBeCloseTo(expectedU, 3);
+                expect(samples[i][1]).toBeCloseTo(expectedV, 3);
+            });
+        });
+
+        it('keeps the same phase correction under a tile position offset', () =>
+        {
+            const texture = makeCroppedTexture(64, 32, frame, orig, trim);
+            const cases: SampleCase[] = [
+                [0, 0, -0.375, 0.0833],
+                [64, 32, 0.9583, 1.4167],
+            ];
+
+            const samples = sample(texture, panelWidth, panelHeight, 0, 1, 1, 10, -6, cases);
+
+            cases.forEach(([, , expectedU, expectedV], i) =>
+            {
+                expect(samples[i][0]).toBeCloseTo(expectedU, 3);
+                expect(samples[i][1]).toBeCloseTo(expectedV, 3);
+            });
+        });
+
+        it('keeps the same phase correction under non-uniform tile scale', () =>
+        {
+            const texture = makeCroppedTexture(64, 32, frame, orig, trim);
+            const cases: SampleCase[] = [
+                [8, 4, -0.0833, 0.1667],
+                [64, 32, 0.5, 2.5],
+            ];
+
+            const samples = sample(texture, panelWidth, panelHeight, 0, 2, 0.5, 0, 0, cases);
+
+            cases.forEach(([, , expectedU, expectedV], i) =>
+            {
+                expect(samples[i][0]).toBeCloseTo(expectedU, 3);
+                expect(samples[i][1]).toBeCloseTo(expectedV, 3);
+            });
+        });
+
+        it('applies no correction when the region is flush with the artwork', () =>
+        {
+            const flushFrame = new Rectangle(0, 0, 48, 24);
+            const texture = makeCroppedTexture(64, 32, flushFrame, new Rectangle(0, 0, 64, 32));
+            const cases: SampleCase[] = [
+                [0, 0, -0.1265, 0.5155],
+                [40, 10, 0.4393, 0.1618],
+                [128, 64, 1.8571, 1.0211],
+            ];
+
+            const samples = sample(texture, panelWidth, panelHeight, 0.4, 1.5, 0.75, 12, -5, cases);
+
+            cases.forEach(([, , expectedU, expectedV], i) =>
+            {
+                expect(samples[i][0]).toBeCloseTo(expectedU, 3);
+                expect(samples[i][1]).toBeCloseTo(expectedV, 3);
+            });
+        });
+
+        it('handles a deeper crop inside a larger artwork', () =>
+        {
+            const texture = makeCroppedTexture(
+                80, 40,
+                new Rectangle(20, 6, 48, 24),
+                new Rectangle(0, 0, 80, 40),
+                new Rectangle(20, 6, 48, 24),
+            );
+            const cases: SampleCase[] = [
+                [0, 0, -0.5431, 0.2655],
+                [40, 10, 0.0227, -0.0882],
+                [128, 64, 1.4405, 0.7711],
+            ];
+
+            const samples = sample(texture, panelWidth, panelHeight, 0.4, 1.5, 0.75, 12, -5, cases);
+
+            cases.forEach(([, , expectedU, expectedV], i) =>
+            {
+                expect(samples[i][0]).toBeCloseTo(expectedU, 3);
+                expect(samples[i][1]).toBeCloseTo(expectedV, 3);
+            });
+        });
+
+        it('handles a crop inside an artwork the same size as the region', () =>
+        {
+            const texture = makeCroppedTexture(
+                52, 36,
+                new Rectangle(3, 10, 48, 24),
+                new Rectangle(0, 0, 48, 24),
+                new Rectangle(3, 10, 48, 24),
+            );
+            const cases: SampleCase[] = [
+                [0, 0, -0.1890, 0.0988],
+                [40, 10, 0.3768, -0.2549],
+                [128, 64, 1.7946, 0.6045],
+            ];
+
+            const samples = sample(texture, panelWidth, panelHeight, 0.4, 1.5, 0.75, 12, -5, cases);
+
+            cases.forEach(([, , expectedU, expectedV], i) =>
+            {
+                expect(samples[i][0]).toBeCloseTo(expectedU, 3);
+                expect(samples[i][1]).toBeCloseTo(expectedV, 3);
+            });
+        });
+
+        it('reports the crop as a tile-normalized offset', () =>
+        {
+            const texture = makeCroppedTexture(80, 40,
+                new Rectangle(20, 6, 48, 24),
+                new Rectangle(0, 0, 80, 40),
+                new Rectangle(20, 6, 48, 24));
+
+            expect(getTrimOffset(texture)).toEqual({ x: 20 / 48, y: 6 / 24 });
+
+            const flush = makeCroppedTexture(64, 32,
+                new Rectangle(0, 0, 48, 24), new Rectangle(0, 0, 64, 32));
+
+            expect(getTrimOffset(flush)).toEqual({ x: 0, y: 0 });
         });
     });
 

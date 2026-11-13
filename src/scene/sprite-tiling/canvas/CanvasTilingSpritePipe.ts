@@ -95,6 +95,17 @@ export class CanvasTilingSpritePipe implements RenderPipe<TilingSprite>
         // patternMatrix = tileTransform x shiftTransform x scaleTransform
         patternMatrix.copyFrom(tilingSprite._tileTransform.matrix);
 
+        // A cropped visible region tiles as a standalone image: shift the pattern by
+        // the crop recorded in `trim` so the region's top-left is tile origin (0, 0).
+        // This translation lives in tile-pixel space ahead of the resolution scaling
+        // below, matching the tile-position convention.
+        const trim = texture.trim;
+
+        if (trim)
+        {
+            patternMatrix.translate(trim.x, trim.y);
+        }
+
         // Apply anchor shift if not applying anchor to texture (v7: uvRespectAnchor)
         if (!tilingSprite.applyAnchorToTexture)
         {

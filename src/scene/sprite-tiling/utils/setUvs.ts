@@ -1,5 +1,6 @@
 import { Matrix } from '../../../maths/matrix/Matrix';
 import { applyMatrix } from './applyMatrix';
+import { getTrimOffset } from './getTrimOffset';
 
 import type { TilingSprite } from '../TilingSprite';
 
@@ -47,4 +48,21 @@ export function setUvs(tilingSprite: TilingSprite, uvs: Float32Array)
     textureMatrix.invert();
 
     applyMatrix(uvs, 2, 0, textureMatrix);
+
+    // The visible region may have been cropped out of a larger original artwork.
+    // Shift the tile phase so that tile (0, 0) lines up with the top-left of the
+    // visible region rather than the original artwork's top-left. This is a
+    // constant offset in tile-normalized units, so it is unaffected by tile
+    // rotation, scale or position (and by the sprite anchor, which only shifts
+    // the quad corners above).
+    const trimOffset = getTrimOffset(texture);
+
+    if (trimOffset.x !== 0 || trimOffset.y !== 0)
+    {
+        for (let i = 0; i < uvs.length; i += 2)
+        {
+            uvs[i] -= trimOffset.x;
+            uvs[i + 1] -= trimOffset.y;
+        }
+    }
 }
